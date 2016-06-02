@@ -57,9 +57,9 @@ def get_crt(account_key, csr, acme_dir, acme_host=None, log=LOGGER, CA=DEFAULT_C
         })
         try:
             resp = urlopen(url, data.encode('utf8'))
-            return resp.getcode(), resp.read()
+            return resp.getcode(), resp.read(), resp.info()
         except IOError as e:
-            return getattr(e, "code", None), getattr(e, "read", e.__str__)()
+            return getattr(e, "code", None), getattr(e, "read", e.__str__)(), None
 
     # find domains
     log.info("Parsing CSR...")
@@ -80,7 +80,7 @@ def get_crt(account_key, csr, acme_dir, acme_host=None, log=LOGGER, CA=DEFAULT_C
 
     # get the certificate domains and expiration
     log.info("Registering account...")
-    code, result = _send_signed_request(CA + "/acme/new-reg", {
+    code, result, headers = _send_signed_request(CA + "/acme/new-reg", {
         "resource": "new-reg",
         "agreement": "https://letsencrypt.org/documents/LE-SA-v1.0.1-July-27-2015.pdf",
     })
@@ -96,7 +96,7 @@ def get_crt(account_key, csr, acme_dir, acme_host=None, log=LOGGER, CA=DEFAULT_C
         log.info("Verifying {0}...".format(domain))
 
         # get new challenge
-        code, result = _send_signed_request(CA + "/acme/new-authz", {
+        code, result, headers = _send_signed_request(CA + "/acme/new-authz", {
             "resource": "new-authz",
             "identifier": {"type": "dns", "value": domain},
         })
@@ -134,7 +134,7 @@ def get_crt(account_key, csr, acme_dir, acme_host=None, log=LOGGER, CA=DEFAULT_C
                 wellknown_path, wellknown_url))
 
         # notify challenge are met
-        code, result = _send_signed_request(challenge['uri'], {
+        code, result, headers = _send_signed_request(challenge['uri'], {
             "resource": "challenge",
             "keyAuthorization": keyauthorization,
         })
@@ -164,17 +164,24 @@ def get_crt(account_key, csr, acme_dir, acme_host=None, log=LOGGER, CA=DEFAULT_C
     proc = subprocess.Popen(["openssl", "req", "-in", csr, "-outform", "DER"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     csr_der, err = proc.communicate()
-    code, result = _send_signed_request(CA + "/acme/new-cert", {
+    code, result, headers = _send_signed_request(CA + "/acme/new-cert", {
         "resource": "new-cert",
         "csr": _b64(csr_der),
     })
     if code != 201:
         raise ValueError("Error signing certificate: {0} {1}".format(code, result))
 
+    def parse_link_header(line):
+        m = re.search(r"^Link:\s*<([^>]*)>(?:\s*;\s*(.*))?\r\n$", line)
+        return (m.group(1), { a[0]: a[1].strip('"') for a in [attr.split("=") for attr in m.group(2).split("\s*;\s*")] })
+
+    up = [link for link, attr in [parse_link_header(l) for l in headers.getallmatchingheaders("Link")] if attr['rel'] == 'up']
+    certchain = [result] + [urlopen(url).read() for url in up]
+
     # return signed certificate!
     log.info("Certificate signed!")
-    return """-----BEGIN CERTIFICATE-----\n{0}\n-----END CERTIFICATE-----\n""".format(
-        "\n".join(textwrap.wrap(base64.b64encode(result).decode('utf8'), 64)))
+    return "".join(["""-----BEGIN CERTIFICATE-----\n{0}\n-----END CERTIFICATE-----\n""".format(
+                    "\n".join(textwrap.wrap(base64.b64encode(cert).decode('utf8'), 64))) for cert in certchain])
 
 def main(argv):
     parser = argparse.ArgumentParser(
